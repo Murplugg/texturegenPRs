@@ -21,14 +21,13 @@ BATCH_SIZE = 64
 STACKING_SIZE = 2
 LEARNING_RATE_D = 0.004
 LEARNING_RATE_G = 0.001
-SAVE_INTERVAL = 64
-SRC_IMAGE = "grassflower.png"
+SAVE_INTERVAL = 512
+#SRC_IMAGE = "grassflower.png"
+SRC_IMAGE = "bark001.png"
 PRINT_TIME = 5000
+TORCH_COMPILE = False
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-def img_int8tofloat(x):
-    return x.float() / 255.0 * 2.0 - 1.0
 
 if IS_COLAB:
     from google.colab import drive
@@ -38,21 +37,21 @@ else:
     imgfilename = f"inputs/{SRC_IMAGE}"
 
 real_img = Image.open(imgfilename)
-real_img = transforms.ToTensor()(real_img).unsqueeze(0).to(device)
+real_img = transforms.ToTensor()(real_img)
+real_img = real_img*2.0-1.0
+real_img = real_img.unsqueeze(0).to(device)
+
+patch_unfold = nn.Unfold(kernel_size=(PATCH_SHAPE[0], PATCH_SHAPE[1]))
+real_patch_unfold = nn.Unfold(kernel_size=(PATCH_SHAPE[0], PATCH_SHAPE[1]))
+real_img = real_patch_unfold(real_img)
 print(real_img.shape, real_img.dtype)
 
 def realimg():
-    ys = torch.randint(0, real_img.shape[2] - PATCH_SHAPE[0], (BATCH_SIZE*STACKING_SIZE,))
-    xs = torch.randint(0, real_img.shape[3] - PATCH_SHAPE[1], (BATCH_SIZE*STACKING_SIZE,))
-    
-    out = []
-    for bs_i in range(BATCH_SIZE*STACKING_SIZE):
-        patch = real_img[:, :, ys[bs_i]:ys[bs_i] + PATCH_SHAPE[0], xs[bs_i]:xs[bs_i] + PATCH_SHAPE[1]]
-        out.append(patch)
-    
-    ret = torch.cat(out, dim=0)
-    ret = ret.view(BATCH_SIZE, STACKING_SIZE * 3, PATCH_SHAPE[0], PATCH_SHAPE[1])
-    return ret
+    output_indices = torch.randint(0, real_img.shape[2], (BATCH_SIZE*STACKING_SIZE,))
+    output = real_img[:, :, output_indices]
+    output = output.transpose(1,2).contiguous()
+    output = output.view(BATCH_SIZE,3*output.shape[1]//BATCH_SIZE,PATCH_SHAPE[0], PATCH_SHAPE[1])
+    return output
 
 class FakeImg(nn.Module):
     def __init__(self):
@@ -63,17 +62,17 @@ class FakeImg(nn.Module):
         processed_img = self.img
         processed_img = torch.cat([processed_img, processed_img[:, :, :PATCH_SHAPE[0] - 1, :]], dim=2)
         processed_img = torch.cat([processed_img, processed_img[:, :, :, :PATCH_SHAPE[1] - 1]], dim=3)
-    
-        ys = torch.randint(0, OUTPUT_SHAPE[0], (BATCH_SIZE * STACKING_SIZE,))
-        xs = torch.randint(0, OUTPUT_SHAPE[1], (BATCH_SIZE * STACKING_SIZE,))
         
-        out = []
-        for bs_i in range(BATCH_SIZE*STACKING_SIZE):
-            patch = processed_img[:, :, ys[bs_i]:ys[bs_i] + PATCH_SHAPE[0], xs[bs_i]:xs[bs_i] + PATCH_SHAPE[1]]
-            out.append(patch)
+        #img_crop_x = torch.randint(0, PATCH_SHAPE[0], ())
+        #img_crop_y = torch.randint(0, PATCH_SHAPE[1], ())
+        #processed_img = processed_img[:, :, img_crop_y:, img_crop_x:]
         
-        ret = torch.cat(out, dim=0).view(BATCH_SIZE, STACKING_SIZE * 3, PATCH_SHAPE[0], PATCH_SHAPE[1])
-        return ret
+        output = patch_unfold(processed_img)
+        output_indices = torch.randint(0, output.shape[2], (BATCH_SIZE*STACKING_SIZE,))
+        output = output[:, :, output_indices]
+        output = output.transpose(1,2).contiguous()
+        output = output.view(BATCH_SIZE,3*output.shape[1]//BATCH_SIZE,PATCH_SHAPE[0], PATCH_SHAPE[1]).contiguous()
+        return output
 
 class Discriminator(nn.Module):
     def __init__(self):
@@ -91,9 +90,13 @@ class Discriminator(nn.Module):
             nn.Conv2d(in_channels=64 * 4, out_channels=64 * 4, kernel_size=3, padding='same')
         ])
         
-        self.lns = nn.ModuleList([nn.LayerNorm([24 * 4, PATCH_SHAPE[0], PATCH_SHAPE[1]]),
-                                  nn.LayerNorm([32 * 4, PATCH_SHAPE[0]//2, PATCH_SHAPE[1]//2]),
-                                  nn.LayerNorm([64 * 4, PATCH_SHAPE[0]//4, PATCH_SHAPE[1]//4])])
+        self.lns = nn.ModuleList([nn.LayerNorm(24 * 4),
+                                  nn.LayerNorm(32 * 4),
+                                  nn.LayerNorm(64 * 4)])
+        
+        self.lns2 = nn.ModuleList([nn.LayerNorm(24 * 4),
+                                   nn.LayerNorm(32 * 4),
+                                   nn.LayerNorm(64 * 4)])
         
         self.pools = nn.ModuleList([nn.AvgPool2d(kernel_size=2),
                                     nn.AvgPool2d(kernel_size=2),
@@ -101,10 +104,19 @@ class Discriminator(nn.Module):
         
         self.lastdense = nn.Linear(64 * 4 * (PATCH_SHAPE[0] // 4) * (PATCH_SHAPE[1] // 4), 1, bias=False)
                 
+    def do_layernorm(self, tensor, lnname):
+        tensor = tensor.permute(0, 2, 3, 1).contiguous()
+        tensor = lnname(tensor)
+        tensor = tensor.permute(0, 3, 1, 2).contiguous()
+        return tensor
+                
+                
     def forward(self, inputdata):
         for n in range(3):
             inputdata = torch.relu(self.convs[n](inputdata))
-            inputdata = inputdata + torch.relu(self.convs2[n](self.lns[n](inputdata)))
+            inputdata = self.do_layernorm(inputdata, self.lns2[n])#self.lns2[n](inputdata)
+            inputdata = inputdata + torch.relu(self.convs2[n](inputdata))
+            inputdata = self.do_layernorm(inputdata, self.lns[n])#self.lns[n](inputdata)
             if self.pools[n] is not None:
                 inputdata = self.pools[n](inputdata)
             
@@ -158,14 +170,22 @@ def train_G():
     loss.mean().backward()
     optimizer_g.step()
 
+
+if TORCH_COMPILE:
+    train_D_opt = torch.compile(train_D)
+    train_G_opt = torch.compile(train_G)
+else:
+    train_D_opt = train_D
+    train_G_opt = train_G
+
 currtime = time.time()
 curriters = 0
 while True:
     iters += 1
     curriters += 1
-    train_D()
+    train_D_opt()
     if iters >= 64:
-        train_G()
+        train_G_opt()
 
     if (time.time() - currtime) * 1000.0 > PRINT_TIME:
         delta = time.time() - currtime
