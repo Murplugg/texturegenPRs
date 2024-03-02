@@ -1,5 +1,8 @@
+#THIS IS AN OLD SCRIPT. use pytorch and texturegen_pytorch.py
 import os
 #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+os.environ['xla_gpu_cuda_data_dir'] = 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.5'
+
 import numpy as np
 import glob
 import matplotlib.pyplot as plt
@@ -9,6 +12,7 @@ import time
 import sys
 IS_COLAB = 'google.colab' in sys.modules
 
+print("THIS IS AN OLD SCRIPT. use pytorch and texturegen_pytorch.py")
 print(f"IS_COLAB: {IS_COLAB}")
 
 OUTPUT_SHAPE = [512,512]
@@ -54,7 +58,7 @@ def realimg():
     for b_i in range(BATCH_SIZE):
         stack = []
         for s_i in range(STACKING_SIZE):
-            actualp = pshape*(s_i+1)
+            actualp = pshape
             y = ys[b_i,s_i]%(real_img.shape[1]-actualp[0])
             x = xs[b_i,s_i]%(real_img.shape[2]-actualp[1])
             patch = real_img[
@@ -62,8 +66,6 @@ def realimg():
                 y:y+actualp[0], 
                 x:x+actualp[1]
             ]
-            if s_i > 0:
-                patch = 
             stack.append(patch)
         out.append(tf.concat(stack,axis=-1))
     
