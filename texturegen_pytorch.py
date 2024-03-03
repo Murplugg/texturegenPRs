@@ -1,43 +1,120 @@
+# Std. lib imports
 import os
+import time
+import sys
+from pathlib import Path
+from typing import Dict, List, Any
+from argparse import ArgumentParser
+
+# 3rd-party imports
 import numpy as np
-import glob
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
+from torch.functional import F
 import torchvision.io as io
-import time
-import sys
+from torch.nn.modules.pooling import FractionalMaxPool2d, LPPool2d
 from PIL import Image
+import matplotlib.pyplot as plt
+
+
+
+def parse_res_str(res: str) -> List[int]:
+    return list(map(int, res.replace(' ', "").lower().split('x')))
+
+
+def res_str(res: List[int]) -> str:
+    return f"{res[0]}x{res[1]}"
+
+
+argparser = ArgumentParser()
+argparser.description = "Something something experimental texture image generator ... ."
+argparser.usage = f"'python3 {Path(__file__).name} -i {os.sep}path{os.sep}to{os.sep}image.png' [--help]"
+
+
+DEFAULT_PARAMS: Dict[str, Any] = {"out_shape": [512, 512],
+                                  "patch_shape": [32, 32],
+                                  "batchsize": 64,
+                                  "stacking_size": 3,
+                                  "lr_init_d": 0.004,
+                                  "lr_init_g": 0.0015,
+                                  "seed": None,
+                                  "n_checkpoint": 256,
+                                  "torch_compile": False,
+                                  "rot_invariant": False,
+                                  "aug_flip_xy": False,
+                                  }
+
+
+argparser.add_argument("-i", "--input", type=str, required=True, help="Image file to generate textures from")
+argparser.add_argument("-r", "--res", type=str, default=res_str(DEFAULT_PARAMS["out_shape"]), help="Output image resolution, e.g. '512x512' (width x height)")
+argparser.add_argument("-ps", "--patch-size", type=str, default=res_str(DEFAULT_PARAMS["patch_shape"]), help="The sampling patch size, e.g. '32x32' (width x height)")
+argparser.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_PARAMS["batchsize"], help="The per-GPU batch size to use")
+argparser.add_argument("-ss", "--stack-size", type=int, default=DEFAULT_PARAMS["stacking_size"], help="Number of samples to compare each iteration. 2-3 recommended.")
+argparser.add_argument("-s", "--seed", type=int, default=DEFAULT_PARAMS["seed"], help="Make the texture generator deterministic with a seed number of choice")
+argparser.add_argument("-lr-d", "--learning-rate-discriminator", type=float, default=DEFAULT_PARAMS["lr_init_d"], help="Initial learning-rate for discriminator network")
+argparser.add_argument("-lr-g", "--learning-rate-generator", type=float, default=DEFAULT_PARAMS["lr_init_g"], help="Initial learning-rate for generator network")
+#argparser.add_argument("-l", "--log", action="store_true", help="Log results to disk")
+#argparser.add_argument("-l", "--log", type=str, default=None, help="Name of file to log results to (filename will be extended with a UTC datetime prefix)")
+argparser.add_argument("--save-interval", type=int, default=DEFAULT_PARAMS["n_checkpoint"], help="Save training progress every ith step")
+argparser.add_argument("-c", "--compile", action="store_true", help="Use Torch Compile for faster learning")
+argparser.add_argument("--device", type=int, default=0, help="Index of GPU to use. For multi-GPU machines (0, 1, ..., k)")
+argparser.add_argument("--a", "--activation", type=str, default="relu", help="Name of activation function between the convolution layers to try")
+
+# ------ A few untested ideas yet to be discussed ------
+#
+argparser.add_argument("-ri", "--rotation-invariant", action="store_true", help="Features in the input image can be generated at any angle (0-360 degrees)")  # TODO: Try randomly rotated patches?
+argparser.add_argument("-f", "--flip", type=str, default=DEFAULT_PARAMS["n_checkpoint"], help="Add horizontally and/or vertically flipped image features for extra data, e.g 'x' for horizontal, 'xy' for both axes")
+
+
+args = argparser.parse_args()
+
+OUTPUT_SHAPE = parse_res_str(args.res)[::-1]  # WxH -> HxW
+PATCH_SHAPE = parse_res_str(args.patch_size)[::-1]  # WxH -> HxW
+BATCH_SIZE = args.batch_size
+STACKING_SIZE = args.stack_size
+LEARNING_RATE_D = args.learning_rate_discriminator
+LEARNING_RATE_G = args.learning_rate_generator
+SAVE_INTERVAL = args.save_interval
+SRC_IMAGE = Path(args.input)
+PRINT_TIME = 5000
+TORCH_COMPILE = args.compile
+SEED: int = args.seed
+device_i: int = args.device
+
+
+if not SRC_IMAGE.exists():
+    print(f"Input image file '{args.input}' not found.", file=sys.stderr)
+    exit(1)
+
+
+if SEED is not None:
+    # import random
+    # random.seed(SEED)
+    # Ref. https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    print(f"RNG seed is {SEED} (numpy, torch)")
+
 
 IS_COLAB = 'google.colab' in sys.modules
-
 print(f"IS_COLAB: {IS_COLAB}")
 
-OUTPUT_SHAPE = [512, 512]
-PATCH_SHAPE = [16, 16]
-BATCH_SIZE = 64
-STACKING_SIZE = 2
-LEARNING_RATE_D = 0.004
-LEARNING_RATE_G = 0.001
-SAVE_INTERVAL = 512
-#SRC_IMAGE = "grassflower.png"
-SRC_IMAGE = "bark001.png"
-PRINT_TIME = 5000
-TORCH_COMPILE = False
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+IMGNAME: str = f"{SRC_IMAGE.name.split('.')[0]}_res{args.res}_patch{args.patch_size}_bs{BATCH_SIZE}_seed{SEED}_stacking{STACKING_SIZE}_gpu{device_i}_relu"
+device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
 if IS_COLAB:
     from google.colab import drive
     drive.mount('/content/gdrive')
     imgfilename = f"/content/gdrive/My Drive/texgen/input/{SRC_IMAGE}"
 else:
-    imgfilename = f"inputs/{SRC_IMAGE}"
+    imgfilename = SRC_IMAGE
 
 real_img = Image.open(imgfilename)
-real_img = transforms.ToTensor()(real_img)
+real_img = transforms.ToTensor()(real_img)[:3, :, :]  # Strip alpha-channel if present
 real_img = real_img*2.0-1.0
 real_img = real_img.unsqueeze(0).to(device)
 
@@ -113,12 +190,13 @@ class Discriminator(nn.Module):
                 
     def forward(self, inputdata):
         for n in range(3):
-            inputdata = torch.relu(self.convs[n](inputdata))
+            inputdata = F.relu(self.convs[n](inputdata))**2
             inputdata = self.do_layernorm(inputdata, self.lns2[n])#self.lns2[n](inputdata)
-            inputdata = inputdata + torch.relu(self.convs2[n](inputdata))
+            inputdata = inputdata + F.relu(self.convs2[n](inputdata))**2
             inputdata = self.do_layernorm(inputdata, self.lns[n])#self.lns[n](inputdata)
             if self.pools[n] is not None:
                 inputdata = self.pools[n](inputdata)
+                #print(inputdata.shape)
             
         inputdata = inputdata.view(inputdata.size(0), -1)
         inputdata = self.lastdense(inputdata)
@@ -148,7 +226,7 @@ def do_thing_D():
 def train_D():
     # train discriminator
     optimizer_d.zero_grad()
-    loss = torch.nn.functional.softplus(do_thing_D())
+    loss = F.softplus(do_thing_D())
     loss.mean().backward()
     optimizer_d.step()
 
@@ -166,7 +244,7 @@ def do_thing_G():
 def train_G():
     # train generator
     optimizer_g.zero_grad()
-    loss = torch.nn.functional.relu(do_thing_G())
+    loss = F.relu(do_thing_G())
     loss.mean().backward()
     optimizer_g.step()
 
@@ -178,29 +256,34 @@ else:
     train_D_opt = train_D
     train_G_opt = train_G
 
-currtime = time.time()
-curriters = 0
-while True:
-    iters += 1
-    curriters += 1
-    train_D_opt()
-    if iters >= 64:
-        train_G_opt()
+try:
+    currtime = time.time()
+    curriters = 0
+    while 1:
+        iters += 1
+        curriters += 1
+        train_D_opt()
+        if iters >= 64:
+            train_G_opt()
 
-    if (time.time() - currtime) * 1000.0 > PRINT_TIME:
-        delta = time.time() - currtime
-        
-        print(f"#{iters}, {delta * 1000.0 / curriters} ms/iter")
+        if (time.time() - currtime) * 1000.0 > PRINT_TIME:
+            delta = time.time() - currtime
+            
+            print(f"#{iters}, {delta * 1000.0 / curriters} ms/iter")
 
-        currtime = time.time()
-        curriters = 0
-    
-    if iters % SAVE_INTERVAL == 0:
-        img = (fakeimg.img.squeeze(0) + 1.0) * 127.5
-        img = torch.clamp(img, 0.0, 255.0).to("cpu")
-        img = img.byte()
+            currtime = time.time()
+            curriters = 0
         
-        if IS_COLAB:
-            io.write_png(img, f"/content/gdrive/My Drive/texgen/{iters}.png")
-        else:
-            io.write_png(img, f"outputs/{iters}.png")
+        if iters % SAVE_INTERVAL == 0:
+            img = (fakeimg.img.squeeze(0) + 1.0) * 127.5
+            img = torch.clamp(img, 0.0, 255.0).to("cpu")
+            img = img.byte()
+            
+            if IS_COLAB:
+                io.write_png(img, f"/content/gdrive/My Drive/texgen/{IMGNAME}_gen{iters}.png")
+            else:
+                outpath: Path = Path(f"outputs/{IMGNAME}_gen{iters}.png")
+                os.makedirs(outpath.parent, exist_ok=True)
+                io.write_png(img, str(outpath))
+except KeyboardInterrupt:
+    print("Run aborted by user")
