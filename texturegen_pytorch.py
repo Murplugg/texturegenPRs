@@ -190,9 +190,9 @@ class Discriminator(nn.Module):
                 
     def forward(self, inputdata):
         for n in range(3):
-            inputdata = F.relu(self.convs[n](inputdata))**2
+            inputdata = F.relu(self.convs[n](inputdata))
             inputdata = self.do_layernorm(inputdata, self.lns2[n])#self.lns2[n](inputdata)
-            inputdata = inputdata + F.relu(self.convs2[n](inputdata))**2
+            inputdata = inputdata + F.relu(self.convs2[n](inputdata))
             inputdata = self.do_layernorm(inputdata, self.lns[n])#self.lns[n](inputdata)
             if self.pools[n] is not None:
                 inputdata = self.pools[n](inputdata)
